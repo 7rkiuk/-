@@ -5,3 +5,20 @@ openai==1.40.0
 yt-dlp==2024.8.6
 psutil==6.0.0
 PyNaCl==1.5.0
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+keep_alive()
