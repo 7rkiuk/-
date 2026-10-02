@@ -1,21 +1,11 @@
-import os
-import re
-import time
-import json
-import asyncio
-import tempfile
-import shutil
-import subprocess
-import threading
-import aiohttp
-import aiosqlite
+import os, re, time, json, asyncio, tempfile, shutil, subprocess, threading
+import aiohttp, aiosqlite
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters)
 
-# جلب التوكن وآيدي المالك من متغيرات البيئة
-TOKEN    = os.environ.get("TOKEN")
+TOKEN    = os.environ.get("TOKEN", "8840043867:AAH62h0FG8AEn-LmHjl1EjlYyrdoFNbSwFk")
 OWNER_ID = int(os.environ.get("OWNER_ID", "1108903232"))
 DB_PATH  = "xk_wm.db"
 UA       = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
@@ -82,35 +72,85 @@ async def guard(update, context):
 
 def run_ytdlp_sync(url, tmpdir):
     out_tpl = os.path.join(tmpdir, "vid.%(ext)s")
-    cmd = ["yt-dlp", "--no-warnings", "--no-playlist", "--no-check-certificates", "-f", "bv*+ba/b[ext=mp4]/b", "--merge-output-format", "mp4", "-o", out_tpl, url]
+    cmd = ["yt-dlp", "--no-warnings", "--no-playlist", "--no-check-certificates", "--user-agent", UA, "-f", "bv*+ba/b[ext=mp4]/b", "--merge-output-format", "mp4", "-o", out_tpl, url]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
 
-async def tiktok_tikwm(session, url):
-    apis = [f"https://www.tikwm.com/api/?url={url}&hd=1", f"https://tikwm.com/api/?url={url}&hd=1"]
-    for api in apis:
-        try:
-            async with session.get(api, timeout=25, headers={"User-Agent": UA}) as r:
-                if r.status != 200: continue
-                data = await r.json(content_type=None)
-                d = data.get("data") if isinstance(data, dict) else None
-                if not d: continue
-                vid = d.get("hdplay") or d.get("play") or d.get("wmplay")
-                if not vid: continue
-                tmpdir = tempfile.mkdtemp(prefix="xktk_")
-                fp = os.path.join(tmpdir, "vid.mp4")
-                headers_dl = {"User-Agent": UA, "Referer": "https://www.tiktok.com/", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
-                async with session.get(vid, timeout=120, headers=headers_dl, allow_redirects=True) as r2:
-                    if r2.status not in (200, 206): continue
-                    data_bytes = await r2.read()
-                    if len(data_bytes) < 200_000: continue
-                    if data_bytes[4:8] != b"ftyp":
-                        continue
-                    with open(fp, "wb") as f: f.write(data_bytes)
-                    return {"path": fp, "tmpdir": tmpdir, "title": d.get("title", "")[:100], "platform": "tiktok"}
-        except Exception:
-            continue
-    return None
+async def try_api_endpoint(session, api_url, url, parse_fn):
+    try:
+        async with session.get(api_url, timeout=30, headers={"User-Agent": UA}) as r:
+            if r.status != 200:
+                print(f"[{api_url[:40]}] status {r.status}")
+                return None
+            data = await r.json(content_type=None)
+            info = parse_fn(data)
+            if not info or not info.get("video"):
+                print(f"[{api_url[:40]}] no video")
+                return None
+            return await download_video(session, info["video"], info)
+    except Exception as e:
+        print(f"[{api_url[:40]}] err {e}")
+        return None
+
+
+async def download_video(session, vid_url, info):
+    tmpdir = tempfile.mkdtemp(prefix="xktk_")
+    fp = os.path.join(tmpdir, "vid.mp4")
+    headers_dl = {"User-Agent": UA, "Referer": "https://www.tiktok.com/", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
+    try:
+        async with session.get(vid_url, timeout=150, headers=headers_dl, allow_redirects=True) as r2:
+            if r2.status not in (200, 206):
+                print(f"dl status {r2.status}")
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                return None
+            data_bytes = await r2.read()
+            if len(data_bytes) < 200_000:
+                print(f"dl small {len(data_bytes)}")
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                return None
+            if data_bytes[4:8] != b"ftyp":
+                print(f"dl not mp4: {data_bytes[:16]}")
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                return None
+            with open(fp, "wb") as f:
+                f.write(data_bytes)
+            return {"path": fp, "tmpdir": tmpdir, "title": str(info.get("title", ""))[:100], "platform": "tiktok"}
+    except Exception as e:
+        print(f"dl err {e}")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return None
+
+
+def parse_tikwm(data):
+    if not isinstance(data, dict): return None
+    d = data.get("data")
+    if not isinstance(d, dict): return None
+    vid = d.get("hdplay") or d.get("play") or d.get("wmplay")
+    if not vid: return None
+    return {"video": vid, "title": d.get("title", ""), "author": (d.get("author") or {}).get("unique_id") if isinstance(d.get("author"), dict) else None}
+
+
+def parse_douyin(data):
+    if not isinstance(data, dict): return None
+    d = data.get("data")
+    if not isinstance(d, dict): return None
+    v = d.get("video_data") or d
+    vid = v.get("nwm_video_url_HQ") or v.get("nwm_video_url") or v.get("play_addr", {}).get("url_list", [None])[0] if isinstance(v.get("play_addr"), dict) else None
+    if not vid: return None
+    return {"video": vid, "title": d.get("desc", ""), "author": (d.get("author") or {}).get("unique_id") if isinstance(d.get("author"), dict) else None}
+
+
+async def process_url(session, url):
+    endpoints = [
+        (f"https://www.tikwm.com/api/?url={url}&hd=1", parse_tikwm),
+        (f"https://tikwm.com/api/?url={url}&hd=1", parse_tikwm),
+        (f"https://api.douyin.wtf/api/hybrid/video_data?url={url}&minimal=false", parse_douyin),
+    ]
+    for api_url, parser in endpoints:
+        result = await try_api_endpoint(session, api_url, url, parser)
+        if result: return result
+    print("all APIs failed, trying yt-dlp...")
+    return await tiktok_ytdlp(url)
 
 
 async def tiktok_ytdlp(url):
@@ -118,10 +158,12 @@ async def tiktok_ytdlp(url):
     loop = asyncio.get_event_loop()
     try:
         res = await loop.run_in_executor(None, run_ytdlp_sync, url, tmpdir)
-    except Exception:
+    except Exception as e:
+        print(f"yt-dlp exception: {e}")
         shutil.rmtree(tmpdir, ignore_errors=True)
         return None
     if res.returncode != 0:
+        print(f"yt-dlp stderr: {res.stderr[:500]}")
         shutil.rmtree(tmpdir, ignore_errors=True)
         return None
     best = None
@@ -136,12 +178,6 @@ async def tiktok_ytdlp(url):
         shutil.rmtree(tmpdir, ignore_errors=True)
         return None
     return {"path": best, "tmpdir": tmpdir, "title": "", "platform": "tiktok"}
-
-
-async def process_url(session, url):
-    result = await tiktok_tikwm(session, url)
-    if result: return result
-    return await tiktok_ytdlp(url)
 
 
 def main_menu_kb():
@@ -180,13 +216,7 @@ async def cmd_start(update, context):
 async def cmd_help(update, context):
     ok, u = await guard(update, context)
     if not ok: return
-    await update.message.reply_text(
-        "📖 <b>الطريقة</b>\n\n"
-        "1. اضغط زر <b>🎵 TikTok</b>\n"
-        "2. اقرأ التعليمات\n"
-        "3. ارجع وارسل الرابط\n\n"
-        "البوت يرد بالفيديو نقي بدون علامة مائية.",
-        parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
+    await update.message.reply_text("📖 أرسل رابط TikTok مباشرة — البوت يرد بالفيديو.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
 
 
 async def cmd_id(update, context):
@@ -228,60 +258,23 @@ async def cb_handler(update, context):
 
     if data == "menu_tiktok":
         await q.message.edit_text(
-            "🎵 <b>TikTok</b>\n\n"
-            "أرسل رابط الفيديو، وسأرجّعه لك بدون علامة مائية.\n\n"
-            "<b>طريقة الحصول على الرابط:</b>\n"
-            "1. افتح TikTok\n"
-            "2. اختر الفيديو\n"
-            "3. اضغط Share (سهم)\n"
-            "4. اختر <b>Copy Link</b>\n"
-            "5. ارجع هنا والصق الرابط",
+            "🎵 <b>TikTok</b>\n\nأرسل رابط الفيديو، وأرجّعه لك بدون علامة مائية.\n\n"
+            "<b>طريقة الحصول على الرابط:</b>\n1. افتح TikTok\n2. اختر الفيديو\n3. Share\n4. Copy Link\n5. ارجع هنا والصق",
             parse_mode=ParseMode.HTML, reply_markup=tiktok_menu_kb())
-
     elif data == "tt_how":
-        await q.message.edit_text(
-            "📖 <b>طريقة الاستخدام خطوة بخطوة</b>\n\n"
-            "1. افتح تطبيق TikTok\n"
-            "2. اذهب للفيديو\n"
-            "3. اضغط أيقونة المشاركة (سهم)\n"
-            "4. اختر Copy Link\n"
-            "5. ارجع لتيليجرام والصق الرابط\n"
-            "6. انتظر ثواني ويصلك الفيديو",
-            parse_mode=ParseMode.HTML, reply_markup=back_kb())
-
+        await q.message.edit_text("📖 <b>الخطوات</b>\n\n1. افتح TikTok\n2. اختر الفيديو\n3. Share → Copy Link\n4. الصق هنا\n5. انتظر 10-30 ثانية", parse_mode=ParseMode.HTML, reply_markup=back_kb())
     elif data == "tt_try":
-        await q.message.edit_text(
-            "🔗 <b>مثال على الرابط:</b>\n\n"
-            "<code>https://vt.tiktok.com/ZSb5QJ6gn/</code>\n\n"
-            "الصق رابطك في المحادثة الآن.",
-            parse_mode=ParseMode.HTML, reply_markup=back_kb())
-
+        await q.message.edit_text("🔗 مثال:\n<code>https://vt.tiktok.com/ZSb5QJ6gn/</code>\n\nالصق رابطك في المحادثة.", parse_mode=ParseMode.HTML, reply_markup=back_kb())
     elif data == "my_stats":
         u = q.from_user
         downloads = await db_get(u.id)
-        await q.message.edit_text(
-            f"📊 <b>إحصائياتك</b>\n\n"
-            f"الآيدي: <code>{u.id}</code>\n"
-            f"عدد التحميلات: <b>{downloads}</b>",
-            parse_mode=ParseMode.HTML, reply_markup=back_kb())
-
+        await q.message.edit_text(f"📊 <b>إحصائياتك</b>\n\nالآيدي: <code>{u.id}</code>\nالتحميلات: <b>{downloads}</b>", parse_mode=ParseMode.HTML, reply_markup=back_kb())
     elif data == "how_to":
-        await q.message.edit_text(
-            "❓ <b>كيف تستخدم البوت</b>\n\n"
-            "1. اضغط <b>🎵 TikTok</b>\n"
-            "2. انسخ رابط الفيديو\n"
-            "3. الصق الرابط في المحادثة",
-            parse_mode=ParseMode.HTML, reply_markup=back_kb())
-
+        await q.message.edit_text("❓ الصق رابط TikTok في المحادثة مباشرة.", parse_mode=ParseMode.HTML, reply_markup=back_kb())
     elif data == "back_main":
         u = q.from_user
         downloads = await db_get(u.id)
-        await q.message.edit_text(
-            f"👋 أهلاً <b>{u.first_name}</b>!\n\n"
-            f"🎬 <b>XK WM Remover</b>\n"
-            f"عدد تحميلاتك: <b>{downloads}</b>\n\n"
-            f"اختار من الأزرار:",
-            parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
+        await q.message.edit_text(f"👋 أهلاً <b>{u.first_name}</b>!\n\n🎬 <b>XK WM Remover</b>\nتحميلاتك: <b>{downloads}</b>\n\nاختار:", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
 
 
 async def handle_url(update, context):
@@ -299,7 +292,14 @@ async def handle_url(update, context):
             await msg.edit_text(f"❌ خطأ: {str(e)[:300]}")
             return
     if not result:
-        await msg.edit_text("❌ فشل التحميل. تأكد من أن الفيديو غير خاص أو أعد المحاولة بعد قليل.")
+        await msg.edit_text(
+            "❌ فشل التحميل.\n\n"
+            "كل المصادر رجعت فارغة.\n\n"
+            "• الرابط قديم أو محذوف\n"
+            "• الفيديو خاص\n"
+            "• السيرفر محجوب من TikTok (Render)\n\n"
+            "الحل: انقل البوت إلى Fly.io أو Oracle Cloud."
+        )
         return
     cap = "✅ TikTok"
     if result.get("title"): cap += f"\n{result['title'][:100]}"
@@ -322,8 +322,6 @@ async def post_init(app):
 
 
 def main():
-    if not TOKEN:
-        raise ValueError("TOKEN environment variable is missing!")
     start_flask()
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
