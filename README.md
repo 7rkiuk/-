@@ -1,11 +1,21 @@
-import os, re, time, json, asyncio, tempfile, shutil, subprocess, threading
-import aiohttp, aiosqlite
+import os
+import re
+import time
+import json
+import asyncio
+import tempfile
+import shutil
+import subprocess
+import threading
+import aiohttp
+import aiosqlite
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters)
 
-TOKEN    = os.environ.get("TOKEN", "8840043867:AAH62h0FG8AEn-LmHjl1EjlYyrdoFNbSwFk")
+# جلب التوكن وآيدي المالك من متغيرات البيئة تلقائياً
+TOKEN    = os.environ.get("TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", "1108903232"))
 DB_PATH  = "xk_wm.db"
 UA       = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
@@ -95,12 +105,10 @@ async def tiktok_tikwm(session, url):
                     data_bytes = await r2.read()
                     if len(data_bytes) < 200_000: continue
                     if data_bytes[4:8] != b"ftyp":
-                        print(f"not mp4: {data_bytes[:16]}")
                         continue
                     with open(fp, "wb") as f: f.write(data_bytes)
                     return {"path": fp, "tmpdir": tmpdir, "title": d.get("title", "")[:100], "platform": "tiktok"}
-        except Exception as e:
-            print(f"tikwm fail: {e}")
+        except Exception:
             continue
     return None
 
@@ -110,12 +118,10 @@ async def tiktok_ytdlp(url):
     loop = asyncio.get_event_loop()
     try:
         res = await loop.run_in_executor(None, run_ytdlp_sync, url, tmpdir)
-    except Exception as e:
-        print(f"yt-dlp exception: {e}")
+    except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
         return None
     if res.returncode != 0:
-        print(f"yt-dlp stderr: {res.stderr[:500]}")
         shutil.rmtree(tmpdir, ignore_errors=True)
         return None
     best = None
@@ -135,7 +141,6 @@ async def tiktok_ytdlp(url):
 async def process_url(session, url):
     result = await tiktok_tikwm(session, url)
     if result: return result
-    print("tikwm failed, trying yt-dlp...")
     return await tiktok_ytdlp(url)
 
 
@@ -236,23 +241,18 @@ async def cb_handler(update, context):
     elif data == "tt_how":
         await q.message.edit_text(
             "📖 <b>طريقة الاستخدام خطوة بخطوة</b>\n\n"
-            "<b>من الآيباد:</b>\n"
             "1. افتح تطبيق TikTok\n"
             "2. اذهب للفيديو\n"
             "3. اضغط أيقونة المشاركة (سهم)\n"
             "4. اختر Copy Link\n"
-            "5. ارجع لتيليجرام\n"
-            "6. الصق الرابط في المحادثة\n"
-            "7. انتظر 5-15 ثانية\n"
-            "8. الفيديو يجيك",
+            "5. ارجع لتيليجرام والصق الرابط\n"
+            "6. انتظر ثواني ويصلك الفيديو",
             parse_mode=ParseMode.HTML, reply_markup=back_kb())
 
     elif data == "tt_try":
         await q.message.edit_text(
             "🔗 <b>مثال على الرابط:</b>\n\n"
-            "<code>https://vt.tiktok.com/ZSb5QJ6gn/</code>\n"
-            "أو\n"
-            "<code>https://www.tiktok.com/@user/video/1234567890</code>\n\n"
+            "<code>https://vt.tiktok.com/ZSb5QJ6gn/</code>\n\n"
             "الصق رابطك في المحادثة الآن.",
             parse_mode=ParseMode.HTML, reply_markup=back_kb())
 
@@ -269,10 +269,8 @@ async def cb_handler(update, context):
         await q.message.edit_text(
             "❓ <b>كيف تستخدم البوت</b>\n\n"
             "1. اضغط <b>🎵 TikTok</b>\n"
-            "2. انسخ رابط الفيديو من تطبيق TikTok\n"
-            "3. الصق الرابط في المحادثة\n"
-            "4. انتظر البوت يرد بالفيديو\n\n"
-            "البوت يقبل أي رابط TikTok رسمي.",
+            "2. انسخ رابط الفيديو\n"
+            "3. الصق الرابط في المحادثة",
             parse_mode=ParseMode.HTML, reply_markup=back_kb())
 
     elif data == "back_main":
@@ -301,14 +299,7 @@ async def handle_url(update, context):
             await msg.edit_text(f"❌ خطأ: {str(e)[:300]}")
             return
     if not result:
-        await msg.edit_text(
-            "❌ فشل التحميل.\n\n"
-            "الأسباب:\n"
-            "• الرابط قديم أو محذوف\n"
-            "• الفيديو خاص\n"
-            "• TikTok يحجب الطلب مؤقتاً\n\n"
-            "جرّب رابط آخر أو أعد المحاولة بعد دقيقة."
-        )
+        await msg.edit_text("❌ فشل التحميل. تأكد من أن الفيديو غير خاص أو أعد المحاولة بعد قليل.")
         return
     cap = "✅ TikTok"
     if result.get("title"): cap += f"\n{result['title'][:100]}"
@@ -331,6 +322,8 @@ async def post_init(app):
 
 
 def main():
+    if not TOKEN:
+        raise ValueError("TOKEN environment variable is missing!")
     start_flask()
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
