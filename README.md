@@ -10,7 +10,6 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "1108903232"))
 DB_PATH  = "xk_wm.db"
 UA       = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
-# ============ FLASK (Render health check) ============
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -30,7 +29,6 @@ def start_flask():
     t.start()
 
 
-# ============ DB ============
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, first_seen INTEGER, last_seen INTEGER, downloads INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0)""")
@@ -72,7 +70,6 @@ async def guard(update, context):
     return True, u
 
 
-# ============ YT-DLP ============
 def run_ytdlp_sync(url, tmpdir):
     out_tpl = os.path.join(tmpdir, "vid.%(ext)s")
     cmd = ["yt-dlp", "--no-warnings", "--no-playlist", "--no-check-certificates", "-f", "bv*+ba/b[ext=mp4]/b", "--merge-output-format", "mp4", "-o", out_tpl, url]
@@ -142,7 +139,6 @@ async def process_url(session, url):
     return await tiktok_ytdlp(url)
 
 
-# ============ KEYBOARDS ============
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎵 TikTok", callback_data="menu_tiktok")],
@@ -164,7 +160,6 @@ def back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀ رجوع", callback_data="back_main")]])
 
 
-# ============ COMMANDS ============
 async def cmd_start(update, context):
     ok, u = await guard(update, context)
     if not ok: return
@@ -221,7 +216,6 @@ async def cmd_broadcast(update, context):
     await update.message.reply_text(f"📢 نجح: {sent} | فشل: {failed}")
 
 
-# ============ CALLBACKS ============
 async def cb_handler(update, context):
     q = update.callback_query
     await q.answer()
@@ -292,7 +286,6 @@ async def cb_handler(update, context):
             parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
 
 
-# ============ HANDLE URL ============
 async def handle_url(update, context):
     ok, u = await guard(update, context)
     if not ok: return
@@ -333,15 +326,12 @@ async def handle_url(update, context):
     await db_log(u.id, url, "tiktok")
 
 
-# ============ START ============
 async def post_init(app):
     await db_init()
 
 
 def main():
-    # Flask first (Render health check)
     start_flask()
-    # Then Telegram bot
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
